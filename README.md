@@ -16,7 +16,7 @@ The full walkthrough is in **[GUIDE.md](GUIDE.md)** (press F1 in the app).
   - a Go-to-time box and an editable keyframe time
   - zoom and a scrollbar
 - **Canvas editing:** drag, resize and Alt+wheel for strength. Editing when the playhead isn't on a keyframe adds one.
-- **Live preview:** uses the same blur code as the export.
+- **Live preview:** uses the same blur code as the export, and plays the source audio (mute with M).
 - **Working with files:**
   - undo/redo
   - autosave and crash recovery
@@ -55,6 +55,7 @@ A `.keyblur` file is JSON:
 |---|---|
 | `keyblur/model.py` | data model, interpolation, time parsing, JSON I/O (no Qt) |
 | `keyblur/video.py` | probing, VOB/VIDEO_TS remux, frame-accurate reader |
+| `keyblur/audio.py` | preview audio playback (PyAV decode → Qt Multimedia) |
 | `keyblur/blur.py` | elliptical blur shared by the preview and export |
 | `keyblur/commands.py` | document, undo commands, range / cut / duplicate operations |
 | `keyblur/export.py` | export dialog and ffmpeg render worker |

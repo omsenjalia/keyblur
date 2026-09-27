@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QPushButton, QSlider, QSplitter, QStyle, QVBoxLayout, QWidget)
 
 from . import __version__, video
+from .audio import AudioPlayer
 from .blur import apply_blurs
 from .commands import DeleteKeyframe, Document, EditKeyframe
 from .export import ExportDialog, ExportWorker
@@ -111,6 +112,7 @@ class MainWindow(QMainWindow):
         self.raw_frame_index = -1
         self.preview_blur = True
         self.playback: Optional[PlaybackThread] = None
+        self.audio = AudioPlayer()
         self._play_t0 = 0.0
         self._play_f0 = 0
         self._pending = None
@@ -149,6 +151,8 @@ class MainWindow(QMainWindow):
         ff = self.settings.value("ffmpeg_path")
         if ff:
             video.set_tool_path("ffmpeg", ff)
+        self.volume.setValue(int(self.settings.value("audio/volume", 100)))
+        self.btn_mute.setChecked(str(self.settings.value("audio/muted", False)).lower() == "true")
         self._on_source()
         QTimer.singleShot(0, self._check_ffmpeg)
         self.setAcceptDrops(True)
@@ -215,6 +219,15 @@ class MainWindow(QMainWindow):
                              "Examples: 3  ·  3.25  ·  1:02.5  ·  0:01:02  ·  f120 (frame 120)")
         self.goto.setFixedWidth(190)
         self.goto.returnPressed.connect(self._goto_time)
+        self.btn_mute = tbtn(QStyle.SP_MediaVolume, tip="Mute / unmute preview audio (M)")
+        self.btn_mute.setCheckable(True)
+        self.btn_mute.toggled.connect(self._set_muted)
+        self.volume = QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setFixedWidth(80)
+        self.volume.setFocusPolicy(Qt.NoFocus)
+        self.volume.setToolTip("Preview volume (the export always keeps the original audio)")
+        self.volume.valueChanged.connect(self._set_volume)
 
         tr = QHBoxLayout()
         for w in (self.btn_prev, self.btn_frame_back, self.btn_play, self.btn_frame_fwd, self.btn_next):
@@ -222,6 +235,8 @@ class MainWindow(QMainWindow):
         tr.addWidget(self.slider, 1)
         tr.addWidget(self.time_label)
         tr.addWidget(self.goto)
+        tr.addWidget(self.btn_mute)
+        tr.addWidget(self.volume)
 
         # blur workflow buttons
         self.btn_blur_range = tbtn(text="Blur In→Out (new track)",
@@ -381,6 +396,7 @@ class MainWindow(QMainWindow):
         self._act(v, "Go to Start", lambda: self.doc.set_frame(0), "Home")
         self._act(v, "Go to End", lambda: self.doc.set_frame(self.doc.frame_count - 1), "End")
         self._act(v, "Go to Time…", self._focus_goto, "Ctrl+G")
+        self._act(v, "Mute Audio", lambda: self.btn_mute.toggle(), "M")
         v.addSeparator()
         self._act(v, "Toggle Preview Blur", lambda: self.chk_blur.toggle(), "B")
         self._act(v, "Toggle Outlines", lambda: self.chk_outline.toggle(), "H")
@@ -555,6 +571,7 @@ class MainWindow(QMainWindow):
         self._play_f0 = start
         self._pending = None
         self._play_t0 = time.perf_counter() + 0.05
+        self.audio.start(self.doc.playable_path, start / float(src.fps), self._play_t0)
         self._play_timer.start()
         self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
 
@@ -562,6 +579,7 @@ class MainWindow(QMainWindow):
         if self.playback is None:
             return
         self._play_timer.stop()
+        self.audio.stop()
         pb = self.playback
         self.playback = None
         pb.stop()
@@ -573,6 +591,7 @@ class MainWindow(QMainWindow):
         pb = self.playback
         if pb is None:
             return
+        self.audio.pump()
         fps = float(self.doc.project.fps)
         due = self._play_f0 + int((time.perf_counter() - self._play_t0) * fps)
         latest = None
@@ -599,6 +618,16 @@ class MainWindow(QMainWindow):
             self.raw_frame, self.raw_frame_index = arr, idx
             self.doc.set_frame(idx)
             self._render()
+
+    def _set_muted(self, muted: bool):
+        self.audio.set_muted(muted)
+        self.btn_mute.setIcon(self.style().standardIcon(QStyle.SP_MediaVolumeMuted if muted
+                                                        else QStyle.SP_MediaVolume))
+        self.settings.setValue("audio/muted", muted)
+
+    def _set_volume(self, v: int):
+        self.audio.set_volume(v / 100)
+        self.settings.setValue("audio/volume", v)
 
     def step(self, n: int):
         self._stop_playback()
@@ -956,7 +985,8 @@ class MainWindow(QMainWindow):
             "Left / Right  Previous / next frame\n"
             "Shift+Left / Right  Back / forward 1 second\n"
             "[ / ]  Previous / next keyframe\n"
-            "Home / End  Start / end,   Ctrl+G  Go to time\n\n"
+            "Home / End  Start / end,   Ctrl+G  Go to time\n"
+            "M  Mute / unmute audio\n\n"
             "RANGE (the easy way)\n"
             "I / O  Set In / Out at playhead   (or Shift+drag on the timeline)\n"
             "Ctrl+B  Blur In→Out with a NEW blur (press again for more)\n"

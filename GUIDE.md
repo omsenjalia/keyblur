@@ -219,6 +219,7 @@ To change it, select the keyframe (click its marker) and use **After key** in th
 | [ / ] | Previous / next keyframe |
 | Home / End | Start / end of video |
 | Ctrl+G | Go to time |
+| M | Mute / unmute preview audio |
 | **I / O** | **Set In / Out** |
 | Shift+I / Shift+O | Jump to In / Out |
 | Alt+X | Clear In/Out |
@@ -247,4 +248,5 @@ To change it, select the keyframe (click its marker) and use **After key** in th
 | The DVD shows the wrong title | Use **Import VIDEO_TS Folder** and choose another title set when asked. |
 | No blur in the export | Check the track's **Visible** box, and that its bar covers that time. |
 | The circle looks stretched | Turn on **Lock aspect**. |
+| No sound when playing | Check the speaker button and volume slider next to **Go to**, and your Windows default playback device. Sound plays only during playback, not while scrubbing. |
 | Disk space | DVD copies are cached in `%LOCALAPPDATA%\KeyBlur\cache` and can be deleted at any time. |
