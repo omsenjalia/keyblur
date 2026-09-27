@@ -6,17 +6,20 @@ import queue
 import time
 from typing import Callable, Optional
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+import json
+from datetime import datetime
+
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
-                               QInputDialog, QLabel, QMainWindow, QMessageBox, QProgressDialog,
+                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressDialog,
                                QPushButton, QSlider, QSplitter, QStyle, QVBoxLayout, QWidget)
 
 from . import __version__, video
 from .blur import apply_blurs
-from .commands import DeleteKeyframe, Document
+from .commands import DeleteKeyframe, Document, EditKeyframe
 from .export import ExportDialog, ExportWorker
-from .model import INTERPOLATIONS, Project, ProjectError
+from .model import INTERPOLATION_LABELS, INTERPOLATIONS, Project, ProjectError, parse_time
 from .widgets.canvas import VideoCanvas
 from .widgets.inspector import Inspector
 from .widgets.timeline import Timeline, fmt_time
@@ -134,15 +137,25 @@ class MainWindow(QMainWindow):
         self.doc.projectChanged.connect(self._update_actions)
         self.doc.playheadChanged.connect(self._update_actions)
 
-        self.resize(1400, 900)
         geo = self.settings.value("geometry")
-        if geo is not None:
-            self.restoreGeometry(geo)
+        if geo is None or not self.restoreGeometry(geo):
+            scr = QApplication.primaryScreen()
+            avail = scr.availableGeometry() if scr else None
+            if avail is not None and (avail.width() < 1600 or avail.height() < 950):
+                self.resize(avail.width(), avail.height())
+                self.setWindowState(Qt.WindowMaximized)
+            else:
+                self.resize(1500, 950)
         ff = self.settings.value("ffmpeg_path")
         if ff:
             video.set_tool_path("ffmpeg", ff)
         self._on_source()
         QTimer.singleShot(0, self._check_ffmpeg)
+        self.setAcceptDrops(True)
+        self._autosave_timer = QTimer(self, interval=60_000)
+        self._autosave_timer.timeout.connect(self._autosave)
+        self._autosave_timer.start()
+        QTimer.singleShot(200, self._offer_recovery)
 
     # ---- UI construction ----------------------------------------------------
     def _build_ui(self):
@@ -167,47 +180,92 @@ class MainWindow(QMainWindow):
 
         # transport
         st = self.style()
-        self.btn_play = QPushButton()
-        self.btn_play.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
-        self.btn_play.setToolTip("Play / Pause (Space)")
-        self.btn_prev = QPushButton()
-        self.btn_prev.setIcon(st.standardIcon(QStyle.SP_MediaSeekBackward))
-        self.btn_prev.setToolTip("Previous keyframe ([)")
-        self.btn_next = QPushButton()
-        self.btn_next.setIcon(st.standardIcon(QStyle.SP_MediaSeekForward))
-        self.btn_next.setToolTip("Next keyframe (])")
+
+        def tbtn(icon=None, text="", tip="", slot=None):
+            b = QPushButton(text)
+            if icon is not None:
+                b.setIcon(st.standardIcon(icon))
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.NoFocus)
+            if slot:
+                b.clicked.connect(slot)
+            return b
+
+        self.btn_prev = tbtn(QStyle.SP_MediaSkipBackward, tip="Previous keyframe ([)",
+                             slot=lambda: self.jump_keyframe(-1))
+        self.btn_frame_back = tbtn(QStyle.SP_MediaSeekBackward, tip="Previous frame (Left)",
+                                   slot=lambda: self.step(-1))
+        self.btn_play = tbtn(QStyle.SP_MediaPlay, tip="Play / Pause (Space)", slot=self.toggle_play)
+        self.btn_frame_fwd = tbtn(QStyle.SP_MediaSeekForward, tip="Next frame (Right)",
+                                  slot=lambda: self.step(1))
+        self.btn_next = tbtn(QStyle.SP_MediaSkipForward, tip="Next keyframe (])",
+                             slot=lambda: self.jump_keyframe(1))
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
-        self.time_label = QLabel("00:00.00 / 00:00.00")
-        self.time_label.setMinimumWidth(170)
-        self.btn_addkf = QPushButton("+ Keyframe at Playhead")
-        self.btn_addkf.setToolTip("Add keyframe to the selected track (K)")
-        self.btn_delkf = QPushButton("Delete Keyframe")
-        self.btn_delkf.setToolTip("Delete the selected track's keyframe at the playhead (Del)")
+        self.slider.setFocusPolicy(Qt.NoFocus)
+        self.time_label = QLabel()
+        self.time_label.setMinimumWidth(250)
+        f = self.time_label.font()
+        f.setFamily("Consolas")
+        f.setPointSize(10)
+        self.time_label.setFont(f)
+        self.goto = QLineEdit()
+        self.goto.setPlaceholderText("Go to: 1:02.5 / 62.5 / f120")
+        self.goto.setToolTip("Type a time and press Enter (Ctrl+G).\n"
+                             "Examples: 3  ·  3.25  ·  1:02.5  ·  0:01:02  ·  f120 (frame 120)")
+        self.goto.setFixedWidth(190)
+        self.goto.returnPressed.connect(self._goto_time)
+
+        tr = QHBoxLayout()
+        for w in (self.btn_prev, self.btn_frame_back, self.btn_play, self.btn_frame_fwd, self.btn_next):
+            tr.addWidget(w)
+        tr.addWidget(self.slider, 1)
+        tr.addWidget(self.time_label)
+        tr.addWidget(self.goto)
+
+        # blur workflow buttons
+        self.btn_blur_range = tbtn(text="Blur In→Out (new track)",
+                                   tip="Blur the In/Out range with a new blur circle (Ctrl+B).\n"
+                                       "Press again for more simultaneous blurs.",
+                                   slot=lambda: self.doc.blur_range(new_track=True))
+        self.btn_blur_range_sel = tbtn(text="Add In→Out to track",
+                                       tip="Blur the In/Out range on the selected track (Ctrl+Shift+B)",
+                                       slot=lambda: self.doc.blur_range(new_track=False))
+        self.btn_unblur_range = tbtn(text="Remove blur In→Out",
+                                     tip="Turn the selected track's blur off inside In/Out (Shift+Del)",
+                                     slot=self.doc.remove_blur_range)
+        self.btn_toggle = tbtn(text="Blur On/Off here",
+                               tip="Turn the selected track's blur off (or back on) from the playhead (X)",
+                               slot=self.toggle_blur)
+        self.btn_addkf = tbtn(text="+ Keyframe", tip="Add keyframe to the selected track (K)",
+                              slot=self.add_keyframe)
+        self.btn_delkf = tbtn(text="− Keyframe", tip="Delete the selected track's keyframe at the playhead (Del)",
+                              slot=self.delete_keyframe)
         self.new_interp = QComboBox()
         for m in INTERPOLATIONS:
-            self.new_interp.addItem(m.capitalize(), m)
+            if m != "off":
+                self.new_interp.addItem(m.capitalize(), m)
         self.new_interp.setCurrentIndex(INTERPOLATIONS.index("linear"))
-        self.new_interp.setToolTip("Interpolation for new keyframes on tracks without earlier keyframes")
+        self.new_interp.setToolTip("Movement type for newly created keyframes")
+        self.new_interp.setFocusPolicy(Qt.NoFocus)
         self.chk_blur = QCheckBox("Preview blur")
         self.chk_blur.setChecked(True)
         self.chk_blur.setToolTip("Toggle the blur in the preview (B)")
         self.chk_outline = QCheckBox("Outlines")
         self.chk_outline.setChecked(True)
-        for w in (self.btn_play, self.btn_prev, self.btn_next, self.btn_addkf, self.btn_delkf,
-                  self.chk_blur, self.chk_outline, self.slider, self.new_interp):
+        self.chk_outline.setToolTip("Show circles and handles (H)")
+        for w in (self.chk_blur, self.chk_outline):
             w.setFocusPolicy(Qt.NoFocus)
+        self.btn_blur_range.setStyleSheet("QPushButton{background:#2d5a8c;color:white;padding:3px 10px;}"
+                                          "QPushButton:disabled{background:#333;color:#777;}")
 
-        tr = QHBoxLayout()
-        tr.addWidget(self.btn_prev)
-        tr.addWidget(self.btn_play)
-        tr.addWidget(self.btn_next)
-        tr.addWidget(self.slider, 1)
-        tr.addWidget(self.time_label)
         tr2 = QHBoxLayout()
-        tr2.addWidget(self.btn_addkf)
-        tr2.addWidget(self.btn_delkf)
-        tr2.addSpacing(16)
+        for w in (self.btn_blur_range, self.btn_blur_range_sel, self.btn_unblur_range):
+            tr2.addWidget(w)
+        tr2.addSpacing(12)
+        for w in (self.btn_toggle, self.btn_addkf, self.btn_delkf):
+            tr2.addWidget(w)
+        tr2.addSpacing(12)
         tr2.addWidget(QLabel("New keys:"))
         tr2.addWidget(self.new_interp)
         tr2.addStretch()
@@ -216,7 +274,7 @@ class MainWindow(QMainWindow):
 
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setContentsMargins(4, 0, 4, 2)
         bl.addWidget(self.timeline, 1)
         bl.addLayout(tr)
         bl.addLayout(tr2)
@@ -225,25 +283,27 @@ class MainWindow(QMainWindow):
         main.addWidget(top)
         main.addWidget(bottom)
         main.setStretchFactor(0, 1)
-        main.setSizes([620, 260])
+        main.setSizes([600, 340])
+        main.setCollapsible(0, False)
+        main.setCollapsible(1, False)
         self.setCentralWidget(main)
         self.statusBar()
 
-        self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_prev.clicked.connect(lambda: self.jump_keyframe(-1))
-        self.btn_next.clicked.connect(lambda: self.jump_keyframe(1))
         self.slider.valueChanged.connect(self._slider_moved)
-        self.btn_addkf.clicked.connect(self.add_keyframe)
-        self.btn_delkf.clicked.connect(self.delete_keyframe)
         self.new_interp.currentIndexChanged.connect(
             lambda _i: setattr(self.doc, "default_interpolation", self.new_interp.currentData()))
         self.chk_blur.toggled.connect(self._set_preview_blur)
         self.chk_outline.toggled.connect(self._set_outlines)
+        self.doc.message.connect(lambda m: self.statusBar().showMessage(m, 4000))
+        self.doc.rangeChanged.connect(self._update_actions)
 
     def _act(self, menu, text, slot, shortcut=None, tip=None) -> QAction:
         a = QAction(text, self)
         if shortcut:
-            a.setShortcut(QKeySequence(shortcut))
+            if isinstance(shortcut, (list, tuple)):
+                a.setShortcuts([QKeySequence(s) for s in shortcut])
+            else:
+                a.setShortcut(QKeySequence(shortcut))
         if tip:
             a.setStatusTip(tip)
         a.triggered.connect(slot)
@@ -281,15 +341,34 @@ class MainWindow(QMainWindow):
         e.addAction(undo)
         e.addAction(redo)
         e.addSeparator()
-        self.act_add_track = self._act(e, "Add &Track", self.add_track, "Ctrl+T")
+        self.act_add_track = self._act(e, "Add &Track (range or from playhead)", self.add_track, "Ctrl+T")
+        self.act_dup_track = self._act(e, "D&uplicate Track", self.doc.duplicate_track, "Ctrl+D")
         self.act_del_track = self._act(e, "Delete Track", self.delete_track, "Ctrl+Shift+Delete")
         e.addSeparator()
         self.act_add_kf = self._act(e, "Add &Keyframe at Playhead", self.add_keyframe, "K")
         self.act_del_kf = self._act(e, "&Delete Keyframe at Playhead", self.delete_keyframe, QKeySequence.Delete)
-        interp = e.addMenu("Set &Interpolation")
+        self.act_toggle = self._act(e, "Blur &On/Off from Playhead", self.toggle_blur, "X")
+        interp = e.addMenu("After Keyframe (&Interpolation)")
         for i, mode in enumerate(INTERPOLATIONS):
-            self._act(interp, mode.capitalize(), lambda _c=False, m_=mode: self.set_interpolation(m_),
-                      f"Alt+{i + 1}")
+            self._act(interp, INTERPOLATION_LABELS[mode],
+                      lambda _c=False, m_=mode: self.set_interpolation(m_), f"Alt+{i + 1}")
+
+        r = mb.addMenu("&Range")
+        self._act(r, "Set &In at Playhead", lambda: self.doc.set_in(), "I")
+        self._act(r, "Set &Out at Playhead", lambda: self.doc.set_out(), "O")
+        self._act(r, "Go to In", lambda: self.doc.in_frame is not None and self.doc.set_frame(self.doc.in_frame),
+                  "Shift+I")
+        self._act(r, "Go to Out", lambda: self.doc.out_frame is not None and self.doc.set_frame(self.doc.out_frame),
+                  "Shift+O")
+        self._act(r, "Clear In/Out", self.doc.clear_range, "Alt+X")
+        r.addSeparator()
+        self.act_blur_range = self._act(r, "&Blur In→Out as New Track", lambda: self.doc.blur_range(True), "Ctrl+B")
+        self.act_blur_range_sel = self._act(r, "Blur In→Out on &Selected Track",
+                                            lambda: self.doc.blur_range(False), "Ctrl+Shift+B")
+        self.act_unblur = self._act(r, "&Remove Blur In→Out from Selected Track", self.doc.remove_blur_range,
+                                    "Shift+Delete")
+        r.addSeparator()
+        self._act(r, "Zoom Timeline to In→Out", self.timeline.view.zoom_to_range, "Ctrl+Shift+0")
 
         v = mb.addMenu("&View")
         self._act(v, "Play / Pause", self.toggle_play, "Space")
@@ -301,13 +380,18 @@ class MainWindow(QMainWindow):
         self._act(v, "Previous Keyframe", lambda: self.jump_keyframe(-1), "[")
         self._act(v, "Go to Start", lambda: self.doc.set_frame(0), "Home")
         self._act(v, "Go to End", lambda: self.doc.set_frame(self.doc.frame_count - 1), "End")
+        self._act(v, "Go to Time…", self._focus_goto, "Ctrl+G")
         v.addSeparator()
         self._act(v, "Toggle Preview Blur", lambda: self.chk_blur.toggle(), "B")
-        self._act(v, "Toggle Outlines", lambda: self.chk_outline.toggle(), "O")
+        self._act(v, "Toggle Outlines", lambda: self.chk_outline.toggle(), "H")
+        v.addSeparator()
+        self._act(v, "Timeline: Zoom In", lambda: self.timeline.view.zoom(1 / 1.5), ["=", "Ctrl+="])
+        self._act(v, "Timeline: Zoom Out", lambda: self.timeline.view.zoom(1.5), ["-", "Ctrl+-"])
         self._act(v, "Timeline: Zoom to Fit", self.timeline.fit_all, "Ctrl+0")
 
         h = mb.addMenu("&Help")
-        self._act(h, "&Shortcuts", self.show_shortcuts, "F1")
+        self._act(h, "User &Guide", self.show_guide, "F1")
+        self._act(h, "&Shortcuts", self.show_shortcuts, "Shift+F1")
         self._act(h, "&About KeyBlur", self.show_about)
         self._refresh_recent()
 
@@ -328,8 +412,26 @@ class MainWindow(QMainWindow):
         self.act_del_kf.setEnabled(kf is not None)
         self.btn_addkf.setEnabled(has and tr is not None and kf is None)
         self.btn_delkf.setEnabled(kf is not None)
-        for w in (self.btn_play, self.btn_prev, self.btn_next, self.slider):
+        for w in (self.btn_play, self.btn_prev, self.btn_next, self.btn_frame_back, self.btn_frame_fwd,
+                  self.slider, self.goto):
             w.setEnabled(has)
+        rng = has and self.doc.has_range
+        self.btn_blur_range.setEnabled(rng)
+        self.act_blur_range.setEnabled(rng)
+        for w in (self.btn_blur_range_sel, self.btn_unblur_range, self.act_blur_range_sel, self.act_unblur):
+            w.setEnabled(rng and tr is not None)
+        self.btn_toggle.setEnabled(has and tr is not None)
+        self.act_toggle.setEnabled(has and tr is not None)
+        self.act_dup_track.setEnabled(tr is not None)
+        if tr is not None and has:
+            on = tr.state_at(self.doc.time) is not None
+            self.btn_toggle.setText("Blur OFF from here" if on else "Blur ON from here")
+        else:
+            self.btn_toggle.setText("Blur On/Off here")
+        self.btn_blur_range.setToolTip(
+            ("Blur the In/Out range with a new blur circle (Ctrl+B).\n"
+             "Press again for more simultaneous blurs.") if rng else
+            "First set a range: press I at the start and O at the end\n(or Shift+drag on the timeline).")
         self.act_relink.setEnabled(self.doc.project.source is not None)
 
     def _on_source(self):
@@ -380,10 +482,22 @@ class MainWindow(QMainWindow):
         self.doc.set_frame(v)
 
     def _update_time_label(self):
-        fps = float(self.doc.project.fps)
-        self.time_label.setText(f"{fmt_time(self.doc.time, fps)} / "
-                                f"{fmt_time(self.doc.project.duration, fps)}   "
-                                f"[{self.doc.frame}]")
+        self.time_label.setText(f"{fmt_time(self.doc.time)} / {fmt_time(self.doc.project.duration)}"
+                                f"   frame {self.doc.frame}")
+
+    def _focus_goto(self):
+        self.goto.setFocus()
+        self.goto.selectAll()
+
+    def _goto_time(self):
+        t = parse_time(self.goto.text(), float(self.doc.project.fps))
+        if t is None:
+            self.statusBar().showMessage("Could not read that time. Try 3.5, 1:02.25 or f120.", 4000)
+            return
+        self._stop_playback()
+        self.doc.set_frame(self.doc.project.frame_of(t))
+        self.goto.clear()
+        self.canvas.setFocus()
 
     def _load_frame(self):
         if self.reader is None:
@@ -535,8 +649,11 @@ class MainWindow(QMainWindow):
         tr = self.doc.selected_track
         seg = self.doc.segment_keyframe(tr) if tr else None
         if seg is not None and seg.interpolation != mode:
-            from .commands import EditKeyframe
             self.doc.stack.push(EditKeyframe(self.doc, tr.id, seg.id, {"interpolation": mode}))
+
+    def toggle_blur(self):
+        if self.doc.has_video and self.doc.selected_track is not None:
+            self.doc.toggle_blur_at_playhead()
 
     # ---- project I/O -------------------------------------------------------------
     def _confirm_discard(self) -> bool:
@@ -546,7 +663,10 @@ class MainWindow(QMainWindow):
                                  QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if r == QMessageBox.Save:
             return self.save()
-        return r == QMessageBox.Discard
+        if r == QMessageBox.Discard:
+            self._remove_autosave()
+            return True
+        return False
 
     def new_project(self):
         if self._confirm_discard():
@@ -595,6 +715,7 @@ class MainWindow(QMainWindow):
             self._error("Could not save", str(e))
             return False
         self.doc.stack.setClean()
+        self._remove_autosave()
         self._add_recent(self.doc.path)
         self.statusBar().showMessage(f"Saved {self.doc.path}", 3000)
         return True
@@ -666,7 +787,8 @@ class MainWindow(QMainWindow):
                                           items, keys.index(main), False)
         return keys[items.index(choice)] if ok else False
 
-    def _prepare_and_load(self, path: str, title_set, project: Optional[Project], project_path: Optional[str]):
+    def _prepare_and_load(self, path: str, title_set, project: Optional[Project], project_path: Optional[str],
+                          dirty: bool = False):
         needs_remux = video.source_type_for(path) != "generic"
         dlg = QProgressDialog("Preparing video…" if not needs_remux else
                               "Remuxing DVD video (lossless, one-time)…", None, 0, 1000, self)
@@ -691,6 +813,8 @@ class MainWindow(QMainWindow):
             self.doc.reset(proj, project_path, playable)
             if project is not None and project_path and old is not None and old.path != src.path:
                 self.doc.stack.resetClean()  # relinked: needs saving
+            if dirty:
+                self.doc.stack.resetClean()
 
         def fail(msg):
             dlg.close()
@@ -818,25 +942,37 @@ class MainWindow(QMainWindow):
     def _error(self, title: str, msg: str):
         QMessageBox.critical(self, title, msg)
 
+    def show_guide(self):
+        guide = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "GUIDE.md")
+        if os.path.isfile(guide):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(guide))
+        else:
+            self.show_shortcuts()
+
     def show_shortcuts(self):
         QMessageBox.information(self, "Shortcuts", (
+            "PLAYBACK\n"
             "Space  Play / pause\n"
             "Left / Right  Previous / next frame\n"
             "Shift+Left / Right  Back / forward 1 second\n"
             "[ / ]  Previous / next keyframe\n"
-            "Home / End  Start / end\n"
-            "K  Add keyframe at playhead\n"
-            "Del  Delete keyframe at playhead\n"
-            "Alt+1 / 2 / 3  Interpolation: Hold / Linear / Ease\n"
-            "Ctrl+T  Add track\n"
-            "B  Toggle preview blur,  O  Toggle outlines\n"
-            "Ctrl+Z / Ctrl+Y  Undo / redo\n"
-            "Ctrl+S  Save,  Ctrl+E  Export\n\n"
-            "Canvas: drag a circle to move, drag handles to resize,\n"
-            "Alt+wheel over the canvas to change strength.\n"
-            "Editing when the playhead is not on a keyframe adds one.\n"
-            "Timeline: click to seek, drag diamonds to retime,\n"
-            "right-click for more, Ctrl+wheel to zoom."))
+            "Home / End  Start / end,   Ctrl+G  Go to time\n\n"
+            "RANGE (the easy way)\n"
+            "I / O  Set In / Out at playhead   (or Shift+drag on the timeline)\n"
+            "Ctrl+B  Blur In→Out with a NEW blur (press again for more)\n"
+            "Ctrl+Shift+B  Blur In→Out on the selected track\n"
+            "Shift+Del  Remove blur In→Out from the selected track\n"
+            "Alt+X  Clear In/Out\n\n"
+            "EDITING\n"
+            "X  Turn the selected blur off / on from the playhead\n"
+            "K / Del  Add / delete keyframe at playhead\n"
+            "Alt+1..4  After key: Hold / Linear / Ease / Off\n"
+            "Ctrl+T  Add track,  Ctrl+D  Duplicate track\n"
+            "Ctrl+Z / Ctrl+Y  Undo / redo\n\n"
+            "VIEW\n"
+            "B  Preview blur,  H  Outlines\n"
+            "= / -  Timeline zoom,  Ctrl+0  Fit\n\n"
+            "Ctrl+S  Save,  Ctrl+E  Export"))
 
     def show_about(self):
         QMessageBox.about(self, "About KeyBlur",
@@ -855,10 +991,77 @@ class MainWindow(QMainWindow):
             e.ignore()
             return
         self._stop_playback()
-        for t in (self._seek_timer, self._render_timer, self._play_timer):
+        for t in (self._seek_timer, self._render_timer, self._play_timer, self._autosave_timer):
             t.stop()
+        self._remove_autosave()
         if self.reader:
             self.reader.close()
             self.reader = None
         self.settings.setValue("geometry", self.saveGeometry())
         e.accept()
+
+    # ---- autosave / recovery -------------------------------------------------------
+    @staticmethod
+    def autosave_path() -> str:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+        d = os.path.join(base, "KeyBlur", "autosave")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "autosave.keyblur")
+
+    def _autosave(self):
+        if not self.doc.has_video or self.doc.stack.isClean():
+            return
+        try:
+            self.doc.project.save(self.autosave_path(), relative_paths=False, extra={
+                "autosave_of": self.doc.path,
+                "autosave_time": datetime.now().isoformat(timespec="seconds"),
+            })
+        except OSError:
+            pass
+
+    def _remove_autosave(self):
+        try:
+            os.remove(self.autosave_path())
+        except OSError:
+            pass
+
+    def _offer_recovery(self):
+        p = self.autosave_path()
+        if not os.path.isfile(p) or self.doc.has_video:
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                meta = json.load(f)
+            proj = Project.load(p)
+        except (OSError, ValueError, ProjectError):
+            self._remove_autosave()
+            return
+        name = os.path.basename(meta.get("autosave_of") or "") or "an unsaved project"
+        r = QMessageBox.question(
+            self, "Recover unsaved work?",
+            f"KeyBlur closed without saving {name}\n(autosaved {meta.get('autosave_time', '?')}).\n\n"
+            "Restore it?", QMessageBox.Yes | QMessageBox.No)
+        if r != QMessageBox.Yes or proj.source is None:
+            self._remove_autosave()
+            return
+        self._prepare_and_load(proj.source.path, proj.source.title_set, project=proj,
+                               project_path=meta.get("autosave_of"), dirty=True)
+
+    # ---- drag & drop -----------------------------------------------------------------
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and any(u.isLocalFile() for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            return
+        path = paths[0]
+        e.acceptProposedAction()
+        if not self._confirm_discard():
+            return
+        if path.lower().endswith(".keyblur"):
+            self.open_project(path)
+        else:
+            self._remember_dir(path)
+            self.open_video(path)

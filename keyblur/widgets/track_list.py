@@ -29,7 +29,7 @@ class TrackList(QWidget):
 
         self.tree = _Tree()
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Track", "Visible", "Sticky"])
+        self.tree.setHeaderLabels(["Track", "Visible", "To end"])
         self.tree.setRootIsDecorated(False)
         self.tree.setDragDropMode(QAbstractItemView.InternalMove)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)

@@ -23,6 +23,7 @@ def win(app, single_vob, monkeypatch, tmp_path):
     from PySide6.QtCore import QSettings
     QSettings.setDefaultFormat(QSettings.IniFormat)
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path))
+    monkeypatch.setattr(MainWindow, "autosave_path", staticmethod(lambda: str(tmp_path / "autosave.keyblur")))
     w = MainWindow()
     w.resize(1200, 800)
     w.show()
@@ -116,7 +117,7 @@ def test_timeline_retime(win, app):
     doc.set_frame(10)
     win.add_track()
     tr = doc.selected_track
-    tl = win.timeline
+    tl = win.timeline.view
     tl.fit_all()
     app.processEvents()
     from keyblur.widgets.timeline import RULER_H, ROW_H
@@ -168,3 +169,38 @@ def test_delete_keyframe_and_track(win, app):
     doc.stack.undo()
     doc.stack.undo()
     assert len(doc.project.tracks) == 1 and len(doc.project.tracks[0].keyframes) == 1
+
+
+def test_shift_drag_range_then_blur_button(win, app):
+    doc = win.doc
+    tl = win.timeline.view
+    tl.fit_all()
+    app.processEvents()
+    from keyblur.widgets.timeline import RULER_H
+    y = RULER_H // 2
+    a = QPoint(int(tl.t2x(doc.project.time_of(30))), y)
+    b = QPoint(int(tl.t2x(doc.project.time_of(60))), y)
+    QTest.mousePress(tl, Qt.LeftButton, Qt.ShiftModifier, a)
+    for i in range(1, 7):
+        QTest.mouseMove(tl, a + (b - a) * (i / 6))
+    QTest.mouseRelease(tl, Qt.LeftButton, Qt.ShiftModifier, b)
+    app.processEvents()
+    assert doc.has_range
+    assert abs(doc.in_frame - 30) <= 1 and abs(doc.out_frame - 60) <= 1
+    assert win.btn_blur_range.isEnabled()
+    win.btn_blur_range.click()
+    win.btn_blur_range.click()
+    app.processEvents()
+    assert len(doc.project.tracks) == 2
+    mid = doc.project.time_of(45)
+    assert len(doc.project.states_at(mid)) == 2
+    assert doc.project.states_at(doc.project.time_of(80)) == []
+
+
+def test_goto_time_box(win, app):
+    win.goto.setText("2.5")
+    win._goto_time()
+    assert win.doc.frame == win.doc.project.frame_of(2.5)
+    win.goto.setText("f10")
+    win._goto_time()
+    assert win.doc.frame == 10

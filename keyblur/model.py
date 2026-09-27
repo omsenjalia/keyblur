@@ -13,7 +13,14 @@ from fractions import Fraction
 from typing import Optional
 
 SCHEMA_VERSION = 1
-INTERPOLATIONS = ("hold", "linear", "ease")
+# "off" = no blur from this keyframe until the next one (lets one track have gaps)
+INTERPOLATIONS = ("hold", "linear", "ease", "off")
+INTERPOLATION_LABELS = {
+    "hold": "Hold (jump at next key)",
+    "linear": "Linear (smooth move)",
+    "ease": "Ease (smooth start/stop)",
+    "off": "Off (no blur until next key)",
+}
 TIME_EPS = 1e-4  # well under half a frame at any realistic fps
 
 DEFAULT_EXPORT_SETTINGS = {
@@ -33,6 +40,38 @@ def normalize_fps(fps: float) -> Fraction:
         if abs(fps - num / 1001) < 0.005:
             return Fraction(num, 1001)
     return Fraction(fps).limit_denominator(1001)
+
+
+def fmt_time(t: float, fps=None) -> str:
+    """Seconds -> 'MM:SS.mmm' (or 'H:MM:SS.mmm')."""
+    ms = int(round(max(0.0, t) * 1000))
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}.{ms:03d}"
+    return f"{m:02d}:{s:02d}.{ms:03d}"
+
+
+def parse_time(text: str, fps: float) -> Optional[float]:
+    """Parse '2', '2.5', '1:02.25', '1:02:03.5', 'f120' / '120f' into seconds."""
+    s = text.strip().lower().replace(",", ".")
+    if not s:
+        return None
+    try:
+        if s.startswith("f"):
+            return int(s[1:]) / fps
+        if s.endswith("f"):
+            return int(s[:-1]) / fps
+        parts = s.split(":")
+        if len(parts) > 3:
+            return None
+        total = 0.0
+        for p in parts:
+            total = total * 60 + float(p or 0)
+        return total if total >= 0 else None
+    except ValueError:
+        return None
 
 
 def _new_id(prefix: str) -> str:
@@ -108,40 +147,65 @@ class Track:
     def keyframe_at(self, t: float) -> Optional[Keyframe]:
         return next((k for k in self.keyframes if abs(k.time - t) < TIME_EPS), None)
 
+    def active_segments(self, duration: float) -> list[tuple[float, float]]:
+        """Time intervals where this track blurs (merged, in order)."""
+        segs: list[tuple[float, float]] = []
+        kfs = self.keyframes
+        for i, k in enumerate(kfs):
+            if k.interpolation == "off":
+                continue
+            if i + 1 < len(kfs):
+                end = kfs[i + 1].time
+            else:
+                end = max(k.time, duration) if self.sticky else k.time
+            if segs and abs(segs[-1][1] - k.time) < TIME_EPS:
+                segs[-1] = (segs[-1][0], end)
+            else:
+                segs.append((k.time, end))
+        return segs
+
     def active_range(self, duration: float) -> Optional[tuple[float, float]]:
-        if not self.keyframes:
+        segs = self.active_segments(duration)
+        if not segs:
             return None
-        start = self.keyframes[0].time
-        end = duration if self.sticky else self.keyframes[-1].time
-        return start, max(start, end)
+        return segs[0][0], segs[-1][1]
+
+    def governing_keyframe(self, t: float) -> Optional[Keyframe]:
+        """Last keyframe at or before t (None if t is before the first keyframe)."""
+        prev = None
+        for k in self.keyframes:
+            if k.time <= t + TIME_EPS:
+                prev = k
+            else:
+                break
+        return prev
 
     def state_at(self, t: float) -> Optional[BlurState]:
         kfs = self.keyframes
-        if not kfs or t < kfs[0].time - TIME_EPS:
+        a = self.governing_keyframe(t)
+        if a is None or a.interpolation == "off":
             return None
-        last = kfs[-1]
-        if t >= last.time - TIME_EPS:
-            if self.sticky or abs(t - last.time) < TIME_EPS:
-                return self._state(last)
+        i = kfs.index(a)
+        if i == len(kfs) - 1:
+            if self.sticky or abs(t - a.time) < TIME_EPS:
+                return self._state(a)
             return None
-        # find segment a <= t < b
-        for a, b in zip(kfs, kfs[1:]):
-            if a.time - TIME_EPS <= t < b.time - TIME_EPS:
-                span = b.time - a.time
-                if a.interpolation == "hold" or span <= 0:
-                    return self._state(a)
-                u = min(1.0, max(0.0, (t - a.time) / span))
-                if a.interpolation == "ease":
-                    u = _ease(u)
-                return BlurState(
-                    x=_lerp(a.x, b.x, u),
-                    y=_lerp(a.y, b.y, u),
-                    radius_x=_lerp(a.radius_x, b.radius_x, u),
-                    radius_y=_lerp(a.radius_y, b.radius_y, u),
-                    strength=_lerp(a.strength, b.strength, u),
-                    track_id=self.id,
-                )
-        return None
+        b = kfs[i + 1]
+        span = b.time - a.time
+        # hold, or a tween into an "off" key (whose values are meaningless): keep a's values
+        if a.interpolation == "hold" or b.interpolation == "off" or span <= 0:
+            return self._state(a)
+        u = min(1.0, max(0.0, (t - a.time) / span))
+        if a.interpolation == "ease":
+            u = _ease(u)
+        return BlurState(
+            x=_lerp(a.x, b.x, u),
+            y=_lerp(a.y, b.y, u),
+            radius_x=_lerp(a.radius_x, b.radius_x, u),
+            radius_y=_lerp(a.radius_y, b.radius_y, u),
+            strength=_lerp(a.strength, b.strength, u),
+            track_id=self.id,
+        )
 
     def _state(self, k: Keyframe) -> BlurState:
         return BlurState(k.x, k.y, k.radius_x, k.radius_y, k.strength, self.id)
@@ -320,8 +384,10 @@ class Project:
         except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
             raise ProjectError(f"Malformed project file: {e}") from e
 
-    def save(self, path: str) -> None:
-        data = self.to_dict(path)
+    def save(self, path: str, relative_paths: bool = True, extra: Optional[dict] = None) -> None:
+        data = self.to_dict(path if relative_paths else None)
+        if extra:
+            data.update(extra)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)

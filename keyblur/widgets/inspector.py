@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout
                                QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget)
 
 from ..commands import Document, EditKeyframe, SetTrackProperty
-from ..model import INTERPOLATIONS
+from ..model import INTERPOLATION_LABELS, INTERPOLATIONS
 from .timeline import fmt_time
 
 
@@ -87,20 +87,30 @@ class Inspector(QGroupBox):
         self.f_strength = FloatField(0, 200, 1, " px")
         self.interp = QComboBox()
         for m in INTERPOLATIONS:
-            self.interp.addItem(m.capitalize(), m)
-        self.interp.setToolTip("How this keyframe moves to the next one:\n"
-                               "Hold = hard cut at the next keyframe\n"
-                               "Linear = constant-speed tween\nEase = smooth start/stop tween")
+            self.interp.addItem(INTERPOLATION_LABELS[m], m)
+        self.time = QDoubleSpinBox()
+        self.time.setDecimals(3)
+        self.time.setSuffix(" s")
+        self.time.setKeyboardTracking(False)
+        self.time.setToolTip("Exact time of the keyframe at the playhead (snaps to the nearest frame)")
+        self.frame_lbl = QLabel()
+        self.frame_lbl.setStyleSheet("color:#888;")
+        time_row = QWidget()
+        tl = QHBoxLayout(time_row)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.addWidget(self.time, 1)
+        tl.addWidget(self.frame_lbl)
         self.lock = QCheckBox("Lock aspect (circle)")
-        self.sticky = QCheckBox("Sticky (stay on until end of video)")
+        self.sticky = QCheckBox("Stay on until end of video")
 
         form = QFormLayout()
+        form.addRow("Key time", time_row)
         form.addRow("X", self.f_x)
         form.addRow("Y", self.f_y)
         form.addRow("Radius X", self.f_rx)
         form.addRow("Radius Y", self.f_ry)
         form.addRow("Strength", self.f_strength)
-        form.addRow("Interpolation", self.interp)
+        form.addRow("After key", self.interp)
         lay = QVBoxLayout(self)
         lay.addWidget(self.status)
         lay.addLayout(form)
@@ -115,6 +125,7 @@ class Inspector(QGroupBox):
             fld.gestureStarted.connect(self._gesture_start)
             fld.gestureEnded.connect(self._gesture_end)
         self.interp.activated.connect(self._interp_changed)
+        self.time.valueChanged.connect(self._time_changed)
         self.lock.toggled.connect(lambda v: self._track_flag("lock_aspect", v))
         self.sticky.toggled.connect(lambda v: self._track_flag("sticky", v))
 
@@ -129,8 +140,9 @@ class Inspector(QGroupBox):
         self._refreshing = True
         tr = self.doc.selected_track
         enabled = tr is not None and self.doc.has_video
-        for w in (*self.fields.values(), self.interp, self.lock, self.sticky):
+        for w in (*self.fields.values(), self.interp, self.lock, self.sticky, self.time):
             w.setEnabled(enabled)
+        self.frame_lbl.setText("")
         if not enabled:
             self.status.setText("Select or add a track to edit its blur." if self.doc.has_video
                                 else "No video loaded.")
@@ -144,20 +156,25 @@ class Inspector(QGroupBox):
         self.f_strength.set_value(s.strength)
         self.lock.setChecked(tr.lock_aspect)
         self.sticky.setChecked(tr.sticky)
-        fps = float(self.doc.project.fps)
         k = self.doc.keyframe_at_playhead(tr)
         seg = self.doc.segment_keyframe(tr)
         if k is not None:
-            self.status.setText(f"<b>{tr.name}</b> - keyframe at {fmt_time(k.time, fps)}")
+            off = " <span style='color:#f88'>(blur turns off)</span>" if k.interpolation == "off" else ""
+            self.status.setText(f"<b>{tr.name}</b> - keyframe at {fmt_time(k.time)}{off}")
         elif tr.state_at(self.doc.time) is not None:
-            self.status.setText(f"<b>{tr.name}</b> - interpolated value. Editing adds a keyframe here.")
+            self.status.setText(f"<b>{tr.name}</b> - blurring (between keys). Editing adds a keyframe here.")
         else:
-            self.status.setText(f"<b>{tr.name}</b> - inactive at playhead. Editing adds a keyframe here.")
+            self.status.setText(f"<b>{tr.name}</b> - <span style='color:#f88'>no blur here</span>. "
+                                "Editing turns it on from here.")
+        self.time.setEnabled(k is not None)
+        self.time.setRange(0.0, max(0.0, self.doc.project.duration))
+        self.time.setValue(k.time if k is not None else self.doc.time)
+        self.frame_lbl.setText(f"frame {self.doc.frame}")
         self.interp.setEnabled(seg is not None)
         if seg is not None:
             self.interp.setCurrentIndex(INTERPOLATIONS.index(seg.interpolation))
-            self.interp.setToolTip(f"Interpolation from the keyframe at {fmt_time(seg.time, fps)} to the next.")
-        self.f_ry.setEnabled(True)
+            self.interp.setToolTip(f"What happens after the keyframe at {fmt_time(seg.time)} "
+                                   "until the next keyframe.")
         self._refreshing = False
 
     # ---- editing --------------------------------------------------------------
@@ -182,6 +199,18 @@ class Inspector(QGroupBox):
         elif tr.lock_aspect and prop == "radius_y":
             changes["radius_x"] = min(1.0, value / self.doc.aspect)
         self.doc.edit_at_playhead(tr, changes, merge_key=f"inspector-{prop}-{self._gesture_n}")
+
+    def _time_changed(self, v: float):
+        if self._refreshing:
+            return
+        tr = self.doc.selected_track
+        k = self.doc.keyframe_at_playhead(tr) if tr else None
+        if k is None:
+            return
+        if self.doc.retime_keyframe(tr, k, v):
+            self.doc.set_frame(self.doc.project.frame_of(k.time))
+        else:
+            self.refresh()
 
     def _interp_changed(self, _idx: int):
         tr = self.doc.selected_track

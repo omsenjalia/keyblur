@@ -127,7 +127,17 @@ class VideoCanvas(QGraphicsView):
 
     # ---- painting -----------------------------------------------------------
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
-        if not self.doc.has_video or not self.show_outlines:
+        if not self.doc.has_video:
+            painter.resetTransform()
+            painter.setPen(QColor("#8a8a90"))
+            f = painter.font()
+            f.setPointSize(12)
+            painter.setFont(f)
+            painter.drawText(self.viewport().rect(), Qt.AlignCenter,
+                             "Drop a video file, .vob, VIDEO_TS folder or .keyblur project here\n\n"
+                             "or use  File > Open Video  (Ctrl+Shift+O)")
+            return
+        if not self.show_outlines:
             return
         painter.setRenderHint(QPainter.Antialiasing)
         scale = self._scale()
@@ -161,7 +171,7 @@ class VideoCanvas(QGraphicsView):
             f = painter.font()
             f.setPointSizeF(max(1.0, 9 / scale))
             painter.setFont(f)
-            label = tr.name + ("  (inactive here - drag to key)" if ghost else "")
+            label = tr.name + ("  (no blur here - drag to turn on)" if ghost else "")
             painter.drawText(QPointF(cx - rx, cy - ry - 4 / scale), label)
 
     # ---- mouse --------------------------------------------------------------
