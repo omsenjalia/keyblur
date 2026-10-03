@@ -30,8 +30,9 @@ class Document(QObject):
         self.playable_path: Optional[str] = None
         self.stack = QUndoStack(self)
         self.selected_track_id: Optional[str] = None
+        self.selected_keys: set[tuple[str, str]] = set()  # (track id, keyframe id)
         self.frame = 0
-        self.default_interpolation = "linear"
+        self.default_interpolation = "hold"
         self.in_frame: Optional[int] = None
         self.out_frame: Optional[int] = None
 
@@ -43,6 +44,7 @@ class Document(QObject):
         self.stack.clear()
         self.stack.setClean()
         self.selected_track_id = project.tracks[0].id if project.tracks else None
+        self.selected_keys = set()
         self.frame = 0
         self.in_frame = self.out_frame = None
         self.sourceChanged.emit()
@@ -73,6 +75,19 @@ class Document(QObject):
         if track_id != self.selected_track_id:
             self.selected_track_id = track_id
             self.selectionChanged.emit()
+
+    def set_key_selection(self, keys) -> None:
+        keys = set(keys)
+        if keys != self.selected_keys:
+            self.selected_keys = keys
+            self.selectionChanged.emit()
+
+    def selected_keyframes(self) -> list[tuple[Track, Keyframe]]:
+        """The multi-selected keyframes that still exist, in time order per track."""
+        out = []
+        for tr in self.project.tracks:
+            out += [(tr, k) for k in tr.keyframes if (tr.id, k.id) in self.selected_keys]
+        return out
 
     @property
     def selected_track(self) -> Optional[Track]:
@@ -299,6 +314,32 @@ class Document(QObject):
             else:
                 self.stack.push(AddKeyframe(self, tr.id, self.new_keyframe_for(tr, t)))
             self.message.emit(f"{tr.name}: blur ON from {fmt_time(t)}")
+
+    def set_keys_interpolation(self, keys: list[tuple[Track, Keyframe]], mode: str) -> int:
+        """Set the given keyframes to mode as one undo step. Returns how many changed."""
+        todo = [(tr, k) for tr, k in keys if k.interpolation != mode]
+        if todo:
+            self.stack.beginMacro(f"Set {len(todo)} keyframes to {mode}")
+            for tr, k in todo:
+                self.stack.push(EditKeyframe(self, tr.id, k.id, {"interpolation": mode}))
+            self.stack.endMacro()
+        self.message.emit(f"{len(todo)} keyframe(s) set to {mode.capitalize()}")
+        return len(todo)
+
+    def set_all_interpolation(self, mode: str, tracks: list[Track]) -> int:
+        """Set every keyframe on the given tracks to mode. "Off" keys are left alone
+        so blur gaps survive."""
+        return self.set_keys_interpolation(
+            [(tr, k) for tr in tracks for k in tr.keyframes if k.interpolation != "off"], mode)
+
+    def delete_keys(self, keys: list[tuple[Track, Keyframe]]) -> None:
+        if not keys:
+            return
+        self.stack.beginMacro(f"Delete {len(keys)} keyframes")
+        for tr, k in keys:
+            self.stack.push(DeleteKeyframe(self, tr.id, k.id))
+        self.stack.endMacro()
+        self.set_key_selection(set())
 
     def duplicate_track(self) -> Optional[Track]:
         tr = self.selected_track

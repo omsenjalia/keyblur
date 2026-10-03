@@ -260,7 +260,7 @@ class MainWindow(QMainWindow):
         for m in INTERPOLATIONS:
             if m != "off":
                 self.new_interp.addItem(m.capitalize(), m)
-        self.new_interp.setCurrentIndex(INTERPOLATIONS.index("linear"))
+        self.new_interp.setCurrentIndex(INTERPOLATIONS.index("hold"))
         self.new_interp.setToolTip("Movement type for newly created keyframes")
         self.new_interp.setFocusPolicy(Qt.NoFocus)
         self.chk_blur = QCheckBox("Preview blur")
@@ -363,10 +363,17 @@ class MainWindow(QMainWindow):
         self.act_add_kf = self._act(e, "Add &Keyframe at Playhead", self.add_keyframe, "K")
         self.act_del_kf = self._act(e, "&Delete Keyframe at Playhead", self.delete_keyframe, QKeySequence.Delete)
         self.act_toggle = self._act(e, "Blur &On/Off from Playhead", self.toggle_blur, "X")
+        self._act(e, "Select &All Keyframes", self.select_all_keys, "Ctrl+A")
         interp = e.addMenu("After Keyframe (&Interpolation)")
         for i, mode in enumerate(INTERPOLATIONS):
             self._act(interp, INTERPOLATION_LABELS[mode],
                       lambda _c=False, m_=mode: self.set_interpolation(m_), f"Alt+{i + 1}")
+        for label, whole in (("Set All Keys on &Track", False), ("Set All Keys in &Project", True)):
+            sub = e.addMenu(label)
+            for mode in INTERPOLATIONS:
+                if mode != "off":
+                    self._act(sub, mode.capitalize(),
+                              lambda _c=False, m_=mode, w_=whole: self.set_all_interpolation(m_, w_))
 
         r = mb.addMenu("&Range")
         self._act(r, "Set &In at Playhead", lambda: self.doc.set_in(), "I")
@@ -425,7 +432,7 @@ class MainWindow(QMainWindow):
         self.act_del_track.setEnabled(tr is not None)
         self.act_add_kf.setEnabled(has and tr is not None)
         kf = self.doc.keyframe_at_playhead(tr) if tr else None
-        self.act_del_kf.setEnabled(kf is not None)
+        self.act_del_kf.setEnabled(kf is not None or bool(self.doc.selected_keys))
         self.btn_addkf.setEnabled(has and tr is not None and kf is None)
         self.btn_delkf.setEnabled(kf is not None)
         for w in (self.btn_play, self.btn_prev, self.btn_next, self.btn_frame_back, self.btn_frame_fwd,
@@ -668,17 +675,34 @@ class MainWindow(QMainWindow):
             return
         self.doc.ensure_keyframe_at_playhead(tr)
 
+    def select_all_keys(self):
+        self.doc.set_key_selection({(tr.id, k.id) for tr in self.doc.project.tracks for k in tr.keyframes})
+        if self.doc.selected_keys:
+            self.doc.message.emit(f"{len(self.doc.selected_keys)} keyframe(s) selected: "
+                                  "Alt+1..4 sets their type, Delete removes them, Esc clears")
+
     def delete_keyframe(self):
+        if self.doc.selected_keys:
+            self.doc.delete_keys(self.doc.selected_keyframes())
+            return
         tr = self.doc.selected_track
         k = self.doc.keyframe_at_playhead(tr) if tr else None
         if k is not None:
             self.doc.stack.push(DeleteKeyframe(self.doc, tr.id, k.id))
 
     def set_interpolation(self, mode: str):
+        if self.doc.selected_keys:
+            self.doc.set_keys_interpolation(self.doc.selected_keyframes(), mode)
+            return
         tr = self.doc.selected_track
         seg = self.doc.segment_keyframe(tr) if tr else None
         if seg is not None and seg.interpolation != mode:
             self.doc.stack.push(EditKeyframe(self.doc, tr.id, seg.id, {"interpolation": mode}))
+
+    def set_all_interpolation(self, mode: str, whole_project: bool):
+        tr = self.doc.selected_track
+        tracks = list(self.doc.project.tracks) if whole_project else ([tr] if tr else [])
+        self.doc.set_all_interpolation(mode, tracks)
 
     def toggle_blur(self):
         if self.doc.has_video and self.doc.selected_track is not None:
@@ -996,7 +1020,8 @@ class MainWindow(QMainWindow):
             "EDITING\n"
             "X  Turn the selected blur off / on from the playhead\n"
             "K / Del  Add / delete keyframe at playhead\n"
-            "Alt+1..4  After key: Hold / Linear / Ease / Off\n"
+            "Alt+1..4  After key: Hold / Linear / Ease / Off (all selected keys)\n"
+            "Ctrl+drag / Ctrl+click  Select several keyframes,  Ctrl+A  All,  Esc  Clear\n"
             "Ctrl+T  Add track,  Ctrl+D  Duplicate track\n"
             "Ctrl+Z / Ctrl+Y  Undo / redo\n\n"
             "VIEW\n"

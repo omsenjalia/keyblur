@@ -9,6 +9,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from keyblur import video  # noqa: E402
+from keyblur.commands import AddKeyframe  # noqa: E402
 from keyblur.main_window import MainWindow  # noqa: E402
 from keyblur.model import Project  # noqa: E402
 
@@ -41,12 +42,12 @@ def scene_to_global(w, sx, sy):
     return c.mapFromScene(sx, sy)
 
 
-def drag(widget, a: QPoint, b: QPoint, steps=6):
-    QTest.mousePress(widget, Qt.LeftButton, Qt.NoModifier, a)
+def drag(widget, a: QPoint, b: QPoint, steps=6, mods=Qt.NoModifier):
+    QTest.mousePress(widget, Qt.LeftButton, mods, a)
     for i in range(1, steps + 1):
         p = a + (b - a) * (i / steps)
         QTest.mouseMove(widget, p)
-    QTest.mouseRelease(widget, Qt.LeftButton, Qt.NoModifier, b)
+    QTest.mouseRelease(widget, Qt.LeftButton, mods, b)
 
 
 def test_loaded(win):
@@ -78,9 +79,9 @@ def test_add_track_drag_autokey_undo(win, app):
     assert len(tr.keyframes) == 1
     doc.stack.redo()
     assert len(tr.keyframes) == 2 and tr.keyframes[1].x == pytest.approx(k2.x)
-    # linear interpolation half-way
+    # hold is the default: the first key stays put until the second
     mid = tr.state_at(doc.project.time_of(30))
-    assert 0.5 < mid.x < k2.x
+    assert mid.x == pytest.approx(tr.keyframes[0].x)
 
 
 def test_resize_handle_lock_aspect(win, app):
@@ -106,10 +107,10 @@ def test_inspector_and_interpolation(win, app):
     win.inspector.f_strength.spin.setValue(60)
     app.processEvents()
     assert tr.keyframes[0].strength == pytest.approx(60)
-    win.set_interpolation("hold")
-    assert tr.keyframes[0].interpolation == "hold"
+    win.set_interpolation("linear")
+    assert tr.keyframes[0].interpolation == "linear"
     doc.stack.undo()
-    assert tr.keyframes[0].interpolation != "hold"
+    assert tr.keyframes[0].interpolation == "hold"
 
 
 def test_timeline_retime(win, app):
@@ -204,3 +205,59 @@ def test_goto_time_box(win, app):
     win.goto.setText("f10")
     win._goto_time()
     assert win.doc.frame == 10
+
+
+def test_set_all_interpolation(win, app):
+    doc = win.doc
+    win.add_track()
+    tr = doc.selected_track
+    for t, m in ((1.0, "linear"), (2.0, "off"), (3.0, "ease")):
+        k = doc.new_keyframe_for(tr, t)
+        k.interpolation = m
+        doc.stack.push(AddKeyframe(doc, tr.id, k))
+    before = [k.interpolation for k in tr.keyframes]
+    assert doc.set_all_interpolation("hold", [tr]) == 2
+    # "off" gaps survive
+    assert [k.interpolation for k in tr.keyframes] == ["hold" if m != "off" else m for m in before]
+    doc.stack.undo()  # one undo step reverts the lot
+    assert [k.interpolation for k in tr.keyframes] == before
+
+
+def test_box_select_keys_and_set_type(win, app):
+    from keyblur.widgets.timeline import ROW_H, RULER_H
+    doc = win.doc
+    win.add_track()
+    tr = doc.selected_track
+    for t in (1.0, 2.0, 3.0, 4.0):
+        if tr.keyframe_at(t) is None:
+            doc.stack.push(AddKeyframe(doc, tr.id, doc.new_keyframe_for(tr, t)))
+    view = win.timeline.view
+    view.view_start, view.view_span = 0.0, 5.0
+    view.update()
+    app.processEvents()
+    y = RULER_H + ROW_H // 2
+    # Ctrl+drag a box around the keys at 2 s and 3 s only
+    a = QPoint(int(view.t2x(1.5)), y - 10)
+    b = QPoint(int(view.t2x(3.5)), y + 10)
+    drag(view, a, b, mods=Qt.ControlModifier)
+    app.processEvents()
+    picked = [k for _t, k in doc.selected_keyframes()]
+    assert [k.time for k in picked] == [2.0, 3.0]
+    # Ctrl+click adds the key at 4 s
+    QTest.mouseClick(view, Qt.LeftButton, Qt.ControlModifier, QPoint(int(view.t2x(4.0)), y))
+    assert len(doc.selected_keys) == 3
+    before = [k.interpolation for k in tr.keyframes]
+    win.set_interpolation("ease")  # what Alt+3 does
+    after = {k.time: k.interpolation for k in tr.keyframes}
+    assert after[2.0] == after[3.0] == after[4.0] == "ease"
+    assert after[1.0] == before[[k.time for k in tr.keyframes].index(1.0)]
+    doc.stack.undo()  # one step
+    assert [k.interpolation for k in tr.keyframes] == before
+    n = len(tr.keyframes)
+    win.delete_keyframe()  # Delete removes the whole selection
+    assert len(tr.keyframes) == n - 3 and not doc.selected_keys
+    # a plain click on empty timeline clears any selection
+    win.select_all_keys()
+    assert doc.selected_keys
+    QTest.mouseClick(view, Qt.LeftButton, Qt.NoModifier, QPoint(int(view.t2x(2.5)), y))
+    assert not doc.selected_keys

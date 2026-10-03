@@ -274,8 +274,13 @@ class TimelineView(QWidget):
             for k in tr.keyframes:
                 x = self.t2x(k.time)
                 at_head = abs(k.time - cur_t) < 1e-4
-                self._draw_key(p, QPointF(x, y + ROW_H / 2), k.interpolation, col,
-                               highlight=(tr.id == sel and at_head))
+                c = QPointF(x, y + ROW_H / 2)
+                if (tr.id, k.id) in self.doc.selected_keys:
+                    p.setPen(QPen(C_SNAP, 2))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawRoundedRect(QRectF(c.x() - DIAMOND - 4, c.y() - DIAMOND - 4,
+                                             2 * DIAMOND + 8, 2 * DIAMOND + 8), 3, 3)
+                self._draw_key(p, c, k.interpolation, col, highlight=(tr.id == sel and at_head))
             p.restore()
 
         # ruler (drawn after rows so labels stay crisp)
@@ -329,6 +334,14 @@ class TimelineView(QWidget):
         # label column separator
         p.setPen(QColor("#3a3a3f"))
         p.drawLine(QPointF(LABEL_W, 0), QPointF(LABEL_W, h))
+
+        # box selection
+        if self._drag and self._drag["mode"] == "marquee":
+            fill = QColor(C_SNAP)
+            fill.setAlpha(30)
+            p.setPen(QPen(C_SNAP, 1, Qt.DashLine))
+            p.setBrush(fill)
+            p.drawRect(self._marquee_rect())
 
         # snap guide
         if self._snap_t is not None and self._drag:
@@ -406,6 +419,18 @@ class TimelineView(QWidget):
                 best, best_d = k, dist
         return tr, best
 
+    def _marquee_rect(self) -> QRectF:
+        return QRectF(self._drag["start"], self._drag["cur"]).normalized()
+
+    def _keys_in(self, r: QRectF) -> set:
+        found = set()
+        for i, tr in enumerate(self.doc.project.tracks):
+            cy = RULER_H + i * ROW_H + ROW_H / 2
+            if r.top() - DIAMOND <= cy <= r.bottom() + DIAMOND:
+                found |= {(tr.id, k.id) for k in tr.keyframes
+                          if r.left() - DIAMOND <= self.t2x(k.time) <= r.right() + DIAMOND}
+        return found
+
     def _range_handle_at(self, x: float) -> Optional[str]:
         rt = self.doc.range_times()
         if not rt:
@@ -435,6 +460,15 @@ class TimelineView(QWidget):
         if pos.x() < LABEL_W:
             return
         t_raw = self.x2t(pos.x())
+        if e.modifiers() & Qt.ControlModifier and pos.y() >= RULER_H:
+            tr, k = self._key_at(pos)
+            if k is not None:  # Ctrl+click: add/remove one key
+                self.doc.set_key_selection(self.doc.selected_keys ^ {(tr.id, k.id)})
+            else:  # Ctrl+drag: box select, adding to what is already selected
+                self._drag = {"mode": "marquee", "start": pos, "cur": pos,
+                              "base": set(self.doc.selected_keys)}
+            self.update()
+            return
         if e.modifiers() & Qt.ShiftModifier:
             f = self.doc.project.frame_of(self.snap(t_raw, self.magnet))
             self._drag = {"mode": "range", "anchor": f}
@@ -444,6 +478,8 @@ class TimelineView(QWidget):
             self._drag = {"mode": handle}
             return
         tr, k = self._key_at(pos)
+        if k is None or (tr.id, k.id) not in self.doc.selected_keys:
+            self.doc.set_key_selection(set())
         if k is not None:
             self._seek(k.time)
             self._drag = {"mode": "key", "track_id": tr.id, "kf_id": k.id,
@@ -480,7 +516,10 @@ class TimelineView(QWidget):
         mode = self._drag["mode"]
         magnet = self._magnet_for(e)
         t_raw = self.x2t(pos.x())
-        if mode == "scrub":
+        if mode == "marquee":
+            self._drag["cur"] = pos
+            self.doc.set_key_selection(self._drag["base"] | self._keys_in(self._marquee_rect()))
+        elif mode == "scrub":
             self._seek(self.snap(t_raw, magnet, include_playhead=False))
         elif mode == "range":
             f = self.doc.project.frame_of(self.snap(t_raw, magnet))
@@ -538,9 +577,18 @@ class TimelineView(QWidget):
         QToolTip.hideText()
 
     def mouseReleaseEvent(self, _e):
+        if self._drag and self._drag["mode"] == "marquee" and self.doc.selected_keys:
+            self.doc.message.emit(f"{len(self.doc.selected_keys)} keyframe(s) selected: "
+                                  "Alt+1..4 sets their type, Delete removes them, Esc clears")
         self._drag = None
         self._snap_t = None
         self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self.doc.selected_keys:
+            self.doc.set_key_selection(set())
+        else:
+            super().keyPressEvent(e)
 
     def leaveEvent(self, _e):
         self._hover_x = None
@@ -567,7 +615,17 @@ class TimelineView(QWidget):
         if tr is not None:
             doc.select_track(tr.id)
             _tr, k = self._key_at(pos)
-            if k is not None:
+            multi = doc.selected_keyframes()
+            if k is not None and (tr.id, k.id) in doc.selected_keys and len(multi) > 1:
+                menu.addSection(f"{len(multi)} selected keyframes")
+                sub = menu.addMenu("After these keyframes")
+                for mode in INTERPOLATIONS:
+                    sub.addAction(INTERPOLATION_LABELS[mode]).triggered.connect(
+                        lambda _c=False, m=mode: doc.set_keys_interpolation(doc.selected_keyframes(), m))
+                menu.addAction("Delete selected keyframes").triggered.connect(
+                    lambda: doc.delete_keys(doc.selected_keyframes()))
+                menu.addAction("Clear selection").triggered.connect(lambda: doc.set_key_selection(set()))
+            elif k is not None:
                 self._seek(k.time)
                 menu.addSection(f"Keyframe {fmt_time(k.time)}")
                 menu.addAction("Delete keyframe").triggered.connect(
@@ -644,7 +702,7 @@ class Timeline(QWidget):
         self.btn_clear = btn("Clear", "Clear In/Out (Alt+X)", doc.clear_range)
         self.range_label = QLabel()
         self.range_label.setStyleSheet("color:#8fb8ff;")
-        hint = QLabel("Shift+drag: range · Double-click: key · Right-click: menu")
+        hint = QLabel("Shift+drag: range · Ctrl+drag: select keys · Double-click: key · Right-click: menu")
         hint.setStyleSheet("color:#777;")
 
         bar = QHBoxLayout()

@@ -131,7 +131,16 @@ Between keyframes, the circle moves according to the **After key** setting of th
 | **Hold** | ■ square | stays still, then **jumps** to the next keyframe's position |
 | **Off** | ] bracket | **no blur** until the next keyframe |
 
-To change it, select the keyframe (click its marker) and use **After key** in the inspector. You can also right-click the marker, or press **Alt+1 / 2 / 3 / 4**. The **New keys** dropdown sets the mode for newly created keyframes.
+To change it, select the keyframe (click its marker) and use **After key** in the inspector. You can also right-click the marker, or press **Alt+1 / 2 / 3 / 4**. The **New keys** dropdown sets the mode for newly created keyframes (**Hold** by default). To convert existing keyframes in one go, use **Edit → Set All Keys on Track** or **Set All Keys in Project** (Off keys are left alone, and one Ctrl+Z undoes it).
+
+**Changing several keyframes at once:**
+
+1. Hold **Ctrl** and drag a box over the timeline. Every keyframe inside it gets a yellow outline. You can box across several tracks.
+2. **Ctrl+click** a keyframe to add it to the selection or take it out. **Ctrl+A** selects every keyframe.
+3. Press **Alt+1 / 2 / 3 / 4**, or right-click one of the selected keyframes, to set them all to Hold / Linear / Ease / Off. **Del** deletes them.
+4. Click an empty part of the timeline, or press **Esc**, to clear the selection.
+
+To give different parts different types, select one group, set it, then select the next group. Each change is a single Ctrl+Z.
 
 > Tip: for a blur that jumps between spots (1 s here, 2 s there, 3 s somewhere else), use **Hold**.
 
@@ -191,6 +200,7 @@ To change it, select the keyframe (click its marker) and use **After key** in th
 | Drag a keyframe marker | move it in time |
 | Double-click a track row | add a keyframe there |
 | Shift+drag | select an In/Out range |
+| Ctrl+drag / Ctrl+click | select several keyframes |
 | Drag the blue In/Out edge on the ruler | adjust the range |
 | Right-click | menu: add or delete keyframes, blur on/off, range actions |
 | Mouse wheel / Ctrl+wheel | scroll / zoom |
@@ -228,8 +238,9 @@ To change it, select the keyframe (click its marker) and use **After key** in th
 | Shift+Del | Remove blur In→Out from the selected track |
 | **X** | **Blur off / on from the playhead** |
 | K | Add keyframe |
-| Del | Delete keyframe at the playhead |
-| Alt+1 / 2 / 3 / 4 | After key: Hold / Linear / Ease / Off |
+| Del | Delete keyframe at the playhead (or all selected keyframes) |
+| Ctrl+A | Select all keyframes |
+| Alt+1 / 2 / 3 / 4 | After key: Hold / Linear / Ease / Off (applies to all selected keyframes) |
 | Ctrl+T | New track (uses the In/Out range if set) |
 | Ctrl+D | Duplicate track |
 | B / H | Preview blur / outlines on/off |
